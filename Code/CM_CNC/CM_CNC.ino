@@ -1,5 +1,8 @@
-#include "SD.h"
-#include "SPI.h"
+//AUTHORS: Callegaro Francesco - Masiero Elia - 17/05/2026
+//Version: 1.0 Stable
+#include <SD.h>
+#include <SPI.h>
+#include <math.h>
 #include <Nextion.h>
 #include <StepperCNC.h>
 #include <Preferences.h>
@@ -20,17 +23,14 @@
 #define altezza_sens   5  //mm
 #define laser_off_x   -3  //mm
 #define laser_off_y  -28  //mm
+#define z_pausa       20  //mm
 //creazione coordinate punti di calibrazione
-//punto 1:
 #define punto_1_x      0  //mm
 #define punto_1_y    295  //mm
-//punto 2:
 #define punto_2_x    255  //mm
 #define punto_2_y    295  //mm
-//punto 3:
 #define punto_3_x      0  //mm
 #define punto_3_y     70  //mm
-//punto 4:
 #define punto_4_x    255  //mm
 #define punto_4_y      0  //mm
 //inizializzazione pin e tempi ventole
@@ -40,31 +40,31 @@
 #define T_TEMP_ON     15
 #define SOGLIA_TEMP 1400
 //inizializzazione pin microsd
-#define sck     18
-#define miso    19
-#define mosi    14
-#define cs       5
+#define sck           18
+#define miso          19
+#define mosi          14
+#define cs             5
 //inizializzazione pin dei motori
-#define sda     23
-#define scl     22
+#define sda           23
+#define scl           22
 //inizializzazione pin nextion
-#define rx_nex  16
-#define tx_nex  17
+#define rx_nex        16
+#define tx_nex        17
 //inizializzazione pin di output
-#define fresa   25
-#define luci_p  13
-#define luci_pp 27
-#define laser_p 26
+#define fresa         25
+#define luci_p        13
+#define luci_pp       27
+#define laser_p       26
 //inizializzazione pin di flag/interrrupt
-#define check12 34
-#define schermo 35
-#define flag    21
-#define flag2   32
-#define poweron 33
+#define check12       34
+#define schermo       35
+#define flag          21
+#define flag2         32
+#define poweron       33
 //inizializzazione indirizzi di trasmissione
-#define adress 0x20
-//coefficente tempo di stampa
-#define coefficente_di_tempo 10
+#define adress      0x20
+//offset da agguingere per tempo di stampa
+#define t_offset     6.5  //ms
 //inizializzo gli oggetti dello schermo
 NexVariable tempos1 = NexVariable(0, 0, "sp1");
 NexVariable tempos2 = NexVariable(0, 0, "sp2");
@@ -126,6 +126,8 @@ NexPage c_bed       = NexPage(0, 0, "bedheight");
 NexPage c_angles    = NexPage(0, 0, "anglesheight");
 NexPage endprint    = NexPage(0, 0, "endprint");
 NexPage setprint    = NexPage(0, 0, "setprint");
+NexPage errore4     = NexPage(0, 0, "errore4");
+NexPage pausa       = NexPage(0, 0, "stampa2");
 
 //inizializzazione eeprom interna
 Preferences preferences;
@@ -134,15 +136,14 @@ TaskHandle_t taskIOHandle = NULL;
 File apribile;
 
 //variabili per il programma
-volatile bool stop_pressed = 0;
-volatile int limiter_milling = 100, task = 1, s = 0;
-volatile float coord_x_min = 0, coord_y_min = 0, feedrate = 0, limiter_stepper = 10, assixyz[3] = { -1, -1, -1 };
-volatile unsigned long line = 0;
+volatile int limiter_milling = 100, stop_pressed = 0, last_p = 0, task = 1, s = 0;
+volatile float coord_x_min = 0, coord_y_min = 0, feedrate = 0, last_z = 0, limiter_stepper = 10, assixyz[3] = { -1, -1, -1 };
+volatile unsigned long line = 0, tempo_stampa = 0, split = 0;
 int i = 0, stato_percentuale_pwm = 50;
 float lunghezza = 0.1, velocita_motori = 6, distanza_punta = 0, distanza_punta_base = 0, prev_distanza_punta = 0, prev_distanza_punta_base = 0, z_minima = 0;
 float stampa_x_min = 0, stampa_x_max = 0, stampa_y_min = 0, stampa_y_max = 0, stampa_x = 0, stampa_y = 0, pre_print_x = 0, pre_print_y = 0;
 bool blkm = 0, luci = 0, luci_testa = 0, laser = 0, milling_motor = 0, segno = 1, card = 0, test = 0;
-unsigned long line_max = 0, line_intestazione = 0, check = millis();
+unsigned long line_max = 0, line_intestazione = 0, er = 0, check = millis();
 char nomifile[5][101];
 uint8_t tempofile[5][2];
 
@@ -256,7 +257,16 @@ void inviodati() {
     case 3:
       card = lettura_carta(card);
       if (card == 0) {
-        home.show();
+        errore_carta();
+      }
+      b_press.getValue(&val);
+      delay(10);
+      if (val > 0) {
+        b_press.setValue(0);
+        if ((tempofile[val - 1][0] + tempofile[val - 1][1]) > 0) {
+          STAMPA(val - 1);
+          val = 0;
+        }
       }
       char buf[10];
       stampa1.setText(nomifile[0]);
@@ -274,13 +284,6 @@ void inviodati() {
       stampa5.setText(nomifile[4]);
       sprintf(buf, "%dh %dm", tempofile[4][0], tempofile[4][1]);
       tempos5.setText(buf);
-      b_press.getValue(&val);
-      if (val > 0) {
-        b_press.setValue(0);
-        if ((tempofile[val - 1][0] + tempofile[val - 1][1]) > 0) {
-          STAMPA(val - 1);
-        }
-      }
       break;
     case 4:
       if (assixyz[0] < 0) {
@@ -299,8 +302,10 @@ void inviodati() {
         z_val.setText(String(assixyz[2], 2).c_str());
       }
       b_press.getValue(&val);
+      delay(10);
       if (val == 1) {
         b_press.setValue(0);
+        val = 0;
         process.show();
         blkm = !blkm;
         blkmot(blkm);
@@ -324,6 +329,7 @@ void inviodati() {
       }
       if (val == 2) {
         b_press.setValue(0);
+        val = 0;
         process.show();
         blkm = 1;
         blkmot(blkm);
@@ -349,6 +355,7 @@ void inviodati() {
       }
       if (val == 3) {
         b_press.setValue(0);
+        val = 0;
         process.show();
         blkm = 1;
         blkmot(blkm);
@@ -387,6 +394,7 @@ void inviodati() {
       }
       if (val == 4) {
         b_press.setValue(0);
+        val = 0;
         process.show();
         blkm = 1;
         blkmot(blkm);
@@ -602,6 +610,7 @@ void inviodati() {
         b_press.setValue(0);
         prev_distanza_punta = distanza_punta;
         prev_distanza_punta_base = distanza_punta_base;
+        process.show();
         cambio_punta(0);
         muovi_pos(velocita_motori, float(max_x) / 2.0, float(max_y) / 2.0, z_sicur);
         if (restore() == 1 || distanza_punta_base == 0) {
@@ -623,6 +632,7 @@ void inviodati() {
         b_press.setValue(0);
         prev_distanza_punta = distanza_punta;
         prev_distanza_punta_base = distanza_punta_base;
+        process.show();
         cambio_punta(0);
         muovi_pos(velocita_motori, float(max_x) / 2.0, float(max_y) / 2.0, z_sicur);
         altezza_piano();
@@ -645,6 +655,7 @@ void inviodati() {
         b_press.setValue(0);
         prev_distanza_punta = distanza_punta;
         prev_distanza_punta_base = distanza_punta_base;
+        process.show();
         cambio_punta(0);
         muovi_pos(velocita_motori, float(max_x) / 2.0, float(max_y) / 2.0, z_sicur);
         altezza_angoli();
@@ -766,7 +777,7 @@ void inviodati() {
       vel_mil.setText(buff);
       break;
   }
-  delay(15);
+  delay(30);
 }
 bool lettura_carta(bool prev_card) {
   bool controllo = 0;
@@ -788,9 +799,8 @@ bool lettura_carta(bool prev_card) {
               nomifile[cursore][100] = '\0';
               file.seek(0);
               float tempo = calcola_tempo(file);
-              int totale_minuti = int((tempo * float(coefficente_di_tempo)) + 0.5);
-              int ore = totale_minuti / 60;
-              int minuti = totale_minuti % 60;
+              int ore = int(tempo) / 60;
+              int minuti = int(tempo) % 60;
               tempofile[cursore][0] = ore;
               tempofile[cursore][1] = minuti;
               cursore++;
@@ -814,38 +824,64 @@ bool lettura_carta(bool prev_card) {
   return controllo;
 }
 float calcola_tempo(File file) {
-  char line[100];
-  float x = 0, y = 0, z = 0;
-  float feed = 1000;
-  float tempo_tot = 0;
-  int tipo_mov = 1;
-  while (file.available()) {
-    file.readBytesUntil('\n', line, sizeof(line));
-    if (line[0] == '(') continue;
-    float x_new = x, y_new = y, z_new = z;
-    if (strstr(line, "G0")) tipo_mov = 0;
-    if (strstr(line, "G1")) tipo_mov = 1;
-    char* ptr;
-    if ((ptr = strstr(line, "X"))) x_new = atof(ptr + 1);
-    if ((ptr = strstr(line, "Y"))) y_new = atof(ptr + 1);
-    if ((ptr = strstr(line, "Z"))) z_new = atof(ptr + 1);
-    if ((ptr = strstr(line, "F"))) feed = atof(ptr + 1);
-    float dx = x_new - x;
-    float dy = y_new - y;
-    float dz = z_new - z;
-    float d = sqrt(dx * dx + dy * dy + dz * dz);
-    float v = (tipo_mov == 0) ? 3000.0 : feed;
-    if (v > 0) {
-      tempo_tot += d / v;
+  int len = 0;
+  char line[200];
+  float x = 0, y = 0, z = 0, f = 0, pre_x = 0, pre_y = 0, pre_z = 0, tempo_tot = 0;
+  while(file.available()){
+    len = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[len] = '\0';
+    switch (line[0]) {
+      case 'G':
+        switch (line[1]) {
+          case '0':
+            switch (line[2]) {
+              case '0':
+                switch (line[4]) {
+                  case 'X':
+                    sscanf(line, "%*s X%f Y%f", &x, &y);
+                    break;
+                  case 'Z':
+                    sscanf(line, "%*s Z%f", &z);
+                    break;
+                  case 'F':
+                    sscanf(line, "%*s F%f", &f);
+                    break;
+                  default:
+                    continue;
+                }
+                break;
+              case '1':
+                switch (line[4]) {
+                  case 'X':
+                    sscanf(line, "%*s X%f Y%f", &x, &y);
+                    break;
+                  case 'Z':
+                    sscanf(line, "%*s Z%f", &z);
+                    break;
+                  case 'F':
+                    sscanf(line, "%*s F%f", &f);
+                    break;
+                  default:
+                    continue;
+                }
+                break;
+              default:
+                continue;
+            }
+            break;
+          default:
+            continue;
+        }
+        break;
+      default:
+        continue;
     }
-    x = x_new;
-    y = y_new;
-    z = z_new;
+    tempo_tot += (float(t_offset)/60000.0) + hypot(hypot(x - pre_x, y - pre_y), z - pre_z) / fabs(f);
+    pre_x = x;
+    pre_y = y;
+    pre_z = z;
   }
-  if (tempo_tot > 0 && tempo_tot < 1) {
-    tempo_tot = 1;
-  }
-  return tempo_tot;
+  return tempo_tot + 0.5;
 }
 bool lettura_range(bool prev_card, int indice) {
   bool controllo = 1;
@@ -919,6 +955,17 @@ bool lettura_range(bool prev_card, int indice) {
   }
   return controllo;
 }
+void errore_carta(){
+  uint32_t val = 0;
+  card = 0;
+  errore4.show();
+  while(val == 0){
+    b_press.getValue(&val);
+    delay(300);
+    check_fans();
+  }
+  home.show();
+}
 void muovi_pos(float vel, float posx, float posy, float posz) {
   if (vel < 0 || blkm == 0 || assixyz[2] < 0) {
     return;
@@ -970,7 +1017,6 @@ void azz_tot() {
   muovi_pos(velocita_motori, float(max_x) / 2.0, float(max_y) / 2.0, z_sicur);
 }
 void cambio_punta(int n_punta) {
-  process.show();
   milling_motor = 0;
   pwm_mot(0);
   if (blkm == 0 || assixyz[0] < 0 || assixyz[1] < 0 || assixyz[2] < 0) {
@@ -990,6 +1036,11 @@ void cambio_punta(int n_punta) {
   }
   muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
   muovi_pos(velocita_motori, x_punta, y_punta, z_sicur);
+  if (restore() == 1) {
+    distanza_punta = 0;
+    distanza_punta_base = 0;
+    return;
+  }
   c_punta.show();
   delayS(500);
   uint32_t val = 0;
@@ -1248,6 +1299,8 @@ void STAMPA(int n_file) {
   pwm_mot(0);
   laser = 0;
   att_laser(laser);
+  last_z = 0;
+  last_p = 0;
   coord_x_min = 0;
   coord_y_min = 0;
   stop_pressed = 0;
@@ -1280,7 +1333,7 @@ void STAMPA(int n_file) {
       case 1:
         if (pag != 24) {
           preprint.show();
-          delay(500);
+          delayS(500);
         }
         b_press.getValue(&val);
         if (val == 1) {
@@ -1315,7 +1368,7 @@ void STAMPA(int n_file) {
           nomesel.setText(nomifile[n_file]);
           sprintf(buf1, "%dh %dm", tempofile[n_file][0], tempofile[n_file][1]);
           tempsel.setText(buf1);
-          delay(500);
+          delayS(500);
         }
         b_press.getValue(&val);
         if (val == 1) {
@@ -1327,7 +1380,19 @@ void STAMPA(int n_file) {
           b_press.setValue(0);
           process.show();
           if (blkm == 0) {
-            azz_tot();
+            milling_motor = 0;
+            pwm_mot(0);
+            blkm = 1;
+            blkmot(blkm);
+            s0zz(velocita_motori);
+            movxyz(v_reset, 0, 0, l_reset);
+            s0zz(v_reset);
+            s0xy(velocita_motori);
+            movxyz(v_reset, l_reset, l_reset, 0);
+            s0xy(v_reset);
+            assixyz[0] = 0;
+            assixyz[1] = 0;
+            assixyz[2] = 0;
           }
           muovi_pos(velocita_motori, coord_x_min + laser_off_x, max_y - (coord_y_min - laser_off_y), z_sicur);
           att_laser(1);
@@ -1337,6 +1402,17 @@ void STAMPA(int n_file) {
           muovi_pos(velocita_motori, coord_x_min + laser_off_x, max_y - (coord_y_min - laser_off_y), z_sicur);
           att_laser(0);
           muovi_pos(velocita_motori, float(max_x) / 2.0, float(max_y) / 2.0, z_sicur);
+          if (restore() == 1) {
+            blkm = 0;
+            blkmot(blkm);
+            milling_motor = 0;
+            pwm_mot(0);
+            assixyz[0] = -1;
+            assixyz[1] = -1;
+            assixyz[2] = -1;
+            home.show();
+            return;
+          }
           sicuro.show();
           nomesel.setText(nomifile[n_file]);
           sprintf(buf1, "%dh %dm", tempofile[n_file][0], tempofile[n_file][1]);
@@ -1369,24 +1445,27 @@ void STAMPA(int n_file) {
       card = 0;
       return;
     }
-    delay(15);
+    delayS(30);
   }
-  unsigned long tempo_stampa = millis();
-  unsigned long tempo_agg = 0;
-  stop = 0;
   if (!SD.begin(cs)) {
-    home.show();
-    card = 0;
+    errore_carta();
     return;
   }
   File root = SD.open("/");
   if (!root) {
-    home.show();
-    card = 0;
+    errore_carta();
     return;
   }
   File file = root.openNextFile();
+  unsigned long t_card = millis();
   while (file) {
+    if(millis() - t_card >= 2500){
+      file.close();
+      root.close();
+      SD.end();
+      errore_carta();
+      return;
+    }
     if (!file.isDirectory()) {
       const char* nome = file.name();
       if (strncmp(nome, nomifile[n_file], strlen(nomifile[n_file])) == 0) {
@@ -1397,8 +1476,7 @@ void STAMPA(int n_file) {
           file.close();
           root.close();
           SD.end();
-          home.show();
-          card = 0;
+          errore_carta();
           return;
         }
         break;
@@ -1410,30 +1488,16 @@ void STAMPA(int n_file) {
   root.close();
   if (!apribile) {
     SD.end();
-    home.show();
-    card = 0;
+    errore_carta();
     return;
   }
-  apribile.seek(0);
-  char riga[200];
-  unsigned long current = 0;
-  int len = 0;
-  while (apribile.available()) {
-    len = apribile.readBytesUntil('\n', riga, sizeof(riga) - 1);
-    riga[len] = '\0';
-    if (current >= line) {
-      break;
-    }
-    current++;
-  }
-  task = 3;
-  xTaskCreatePinnedToCore(task_stampa, "task_stampa", 12288, NULL, 1, &taskIOHandle, 0);
   if (strstr(nomifile[n_file], "drl")) {
     mode = 1;
   }
   if (strstr(nomifile[n_file], "Top-Cop")) {
     mode = 1;
   }
+  stop = 0;
   blkm = 1;
   blkmot(blkm);
   s0zz(velocita_motori);
@@ -1445,18 +1509,113 @@ void STAMPA(int n_file) {
   assixyz[0] = 0;
   assixyz[1] = 0;
   assixyz[2] = 0;
+  if (restore() == 1) {
+    apribile.close();
+    SD.end();
+    blkm = 0;
+    blkmot(blkm);
+    milling_motor = 0;
+    pwm_mot(0);
+    laser = 0;
+    att_laser(laser);
+    assixyz[0] = -1;
+    assixyz[1] = -1;
+    assixyz[2] = -1;
+    home.show();
+    card = 0;
+    return;
+  }
+  apribile.seek(0);
+  task = 1;
+  bprestm.setValue(4);
+  delayS(100);
+  tempo_stampa = millis();
+  xTaskCreatePinnedToCore(task_stampa, "task_stampa", 16384, NULL, 1, &taskIOHandle, 0);
   stm.setValue(mode);
   val = 0;
   while (stop == 0) {
-    while (task == 3) {
-      vTaskDelay(1);
-      check_fans();
-    }
     check_fans();
     pagine.getValue(&pag);
     switch (pag) {
       case 0:
         delay(100);
+        break;
+      case 16:
+        pag = 0;
+        bprestm.getValue(&val);
+        switch (val) {
+          case 0:
+            delayS(100);
+            bprestm.getValue(&val);
+            if (val == 0) {
+              if(stop_pressed == 2){
+                pausa.show();
+              }else{
+                print.show();
+              }
+              delayS(400);
+            }
+            val = 0;
+            delayS(100);
+            break;
+          case 1:
+            bprestm.setValue(0);
+            val = 0;
+            stop_pressed = 2;
+            while(task != 3){
+              vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (velocita_motori > limiter_stepper) {
+              muovi_pos(limiter_stepper, assixyz[0], assixyz[1], z_sicur);
+            } else {
+              muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
+            }
+            milling_motor = 0;
+            pwm_mot(0);
+            pausa.show();
+            delayS(300);
+            break;
+          case 2:
+            bprestm.setValue(0);
+            val = 0;
+            luci = !luci;
+            att_luci(luci);
+            setprint.show();
+            delayS(500);
+            break;
+          case 3:
+            bprestm.setValue(0);
+            val = 0;
+            luci_testa = !luci_testa;
+            att_luci_testa(luci_testa);
+            setprint.show();
+            delayS(500);
+            break;
+          case 4:
+            delayS(200);
+            break;
+          case 5:
+            bprestm.setValue(0);
+            val = 0;
+            if (s > limiter_milling) {
+              pwm_mot(limiter_milling);
+            } else {
+              pwm_mot(s);
+            }
+            if (velocita_motori > limiter_stepper) {
+              muovi_pos(limiter_stepper, assixyz[0], assixyz[1], last_z);
+            } else {
+              muovi_pos(velocita_motori, assixyz[0], assixyz[1], last_z);
+            }
+            stop_pressed = 0;
+            task = 1;
+            tempo_stampa = tempo_stampa + (millis() - split);
+            sprintf(buf, "%dh %dm ", (millis() - tempo_stampa) / 3600000, ((millis() - tempo_stampa) % 3600000) / 60000);
+            print.show();
+            delayS(30);
+            tempopr.setText(buf);
+            break;
+        }
         break;
       case 18:
         delay(100);
@@ -1466,42 +1625,6 @@ void STAMPA(int n_file) {
         break;
       case 20:
         delay(100);
-        break;
-      case 16:
-        pag = 0;
-        bprestm.getValue(&val);
-        switch (val) {
-          case 0:
-            delay(100);
-            bprestm.getValue(&val);
-            if (val == 0) {
-              print.show();
-              delay(400);
-            }
-            val = 0;
-            delay(100);
-            break;
-          case 1:
-            bprestm.setValue(0);
-            val = 0;
-            break;
-          case 2:
-            bprestm.setValue(0);
-            val = 0;
-            luci = !luci;
-            att_luci(luci);
-            setprint.show();
-            delay(500);
-            break;
-          case 3:
-            bprestm.setValue(0);
-            val = 0;
-            luci_testa = !luci_testa;
-            att_luci_testa(luci_testa);
-            setprint.show();
-            delay(500);
-            break;
-        }
         break;
       case 23:
         pag = 0;
@@ -1553,59 +1676,216 @@ void STAMPA(int n_file) {
         vel_mil.setText(buff);
         break;
       case 30:
-        stop_pressed = 1;
-        delay(100);
+        if(stop_pressed < 2){
+          stop_pressed = 1;
+        }else{
+          vTaskDelete(taskIOHandle);
+          vTaskDelay(pdMS_TO_TICKS(200));
+          taskIOHandle = NULL;
+          apribile.close();
+          SD.end();
+          milling_motor = 0;
+          pwm_mot(0);
+          laser = 0;
+          att_laser(laser);
+          process.show();
+          muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
+          muovi_pos(velocita_motori, float(max_x) / 2.0, max_y, z_sicur);
+          if (restore() == 1) {
+            blkm = 0;
+            blkmot(blkm);
+            milling_motor = 0;
+            pwm_mot(0);
+            laser = 0;
+            att_laser(laser);
+            assixyz[0] = -1;
+            assixyz[1] = -1;
+            assixyz[2] = -1;
+            home.show();
+            card = 0;
+            return;
+          }
+          home.show();
+          card = 0;
+          return;
+        }
+        delayS(100);
+        break;
+      case 32:
+        pag = 0;
+        b_press.getValue(&val);
+        if(val == 1){
+          process.show();
+          float s_x = assixyz[0];
+          float s_y = assixyz[1];
+          prev_distanza_punta = distanza_punta;
+          prev_distanza_punta_base = distanza_punta_base;
+          cambio_punta(last_p);
+          if(distanza_punta_base == 0){
+            distanza_punta = prev_distanza_punta;
+            distanza_punta_base = prev_distanza_punta_base;
+            preferences.putFloat("punta", distanza_punta);
+            preferences.putFloat("base", distanza_punta_base);
+            vTaskDelete(taskIOHandle);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            taskIOHandle = NULL;
+            apribile.close();
+            SD.end();
+            blkm = 0;
+            blkmot(blkm);
+            milling_motor = 0;
+            pwm_mot(0);
+            laser = 0;
+            att_laser(laser);
+            assixyz[0] = -1;
+            assixyz[1] = -1;
+            assixyz[2] = -1;
+            home.show();
+            card = 0;
+            return;
+          }
+          preferences.putFloat("punta", distanza_punta);
+          preferences.putFloat("base", distanza_punta_base);
+          vTaskDelay(1);
+          muovi_pos(velocita_motori, s_x, s_y, z_sicur);
+          pausa.show();
+          delayS(300);
+        }
+        limiter_stepper = velocita_limiter;
+        limiter_milling = velocita_limiter_pwm;
+        prtname.setText(String(nomifile[n_file]).c_str());
+        x_val.setText(String(assixyz[0], 2).c_str());
+        y_val.setText(String(assixyz[1], 2).c_str());
+        z_val.setText(String(assixyz[2], 2).c_str());
+        if (feedrate > limiter_stepper) {
+          valmlk.setText(String(limiter_stepper, 2).c_str());
+        } else {
+          valmlk.setText(String(feedrate, 2).c_str());
+        }
+        if (s > limiter_milling) {
+          valpwm.setText(String(limiter_milling).c_str());
+        } else {
+          valpwm.setText(String(s).c_str());
+        }
+        delayS(50);
+        if(restore() == 1){
+          vTaskDelete(taskIOHandle);
+          vTaskDelay(pdMS_TO_TICKS(200));
+          taskIOHandle = NULL;
+          apribile.close();
+          SD.end();
+          blkm = 0;
+          blkmot(blkm);
+          milling_motor = 0;
+          pwm_mot(0);
+          laser = 0;
+          att_laser(laser);
+          assixyz[0] = -1;
+          assixyz[1] = -1;
+          assixyz[2] = -1;
+          home.show();
+          card = 0;
+          return;
+        }
         break;
     }
-    if (task == 0) {
-      vTaskDelete(taskIOHandle);
-      taskIOHandle = NULL;
-      apribile.close();
-      SD.end();
-      blkm = 0;
-      blkmot(blkm);
-      milling_motor = 0;
-      pwm_mot(0);
-      laser = 0;
-      att_laser(laser);
-      assixyz[0] = -1;
-      assixyz[1] = -1;
-      assixyz[2] = -1;
-      home.show();
-      card = 0;
-      return;
-    }
-    if (task == -1) {
-      vTaskDelete(taskIOHandle);
-      taskIOHandle = NULL;
-      apribile.close();
-      SD.end();
-      milling_motor = 0;
-      pwm_mot(0);
-      laser = 0;
-      att_laser(laser);
-      process.show();
-      muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
-      muovi_pos(velocita_motori, float(max_x) / 2.0, max_y, z_sicur);
-      home.show();
-      card = 0;
-      return;
-    }
-    if (task == 2) {
-      stop = 1;
+    switch (task) {
+      case -2:
+        vTaskDelete(taskIOHandle);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        taskIOHandle = NULL;
+        apribile.close();
+        SD.end();
+        blkm = 0;
+        blkmot(blkm);
+        milling_motor = 0;
+        pwm_mot(0);
+        laser = 0;
+        att_laser(laser);
+        assixyz[0] = -1;
+        assixyz[1] = -1;
+        assixyz[2] = -1;
+        errore_carta();
+        return;
+      case -1:
+        vTaskDelete(taskIOHandle);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        taskIOHandle = NULL;
+        apribile.close();
+        SD.end();
+        milling_motor = 0;
+        pwm_mot(0);
+        laser = 0;
+        att_laser(laser);
+        process.show();
+        muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
+        muovi_pos(velocita_motori, float(max_x) / 2.0, max_y, z_sicur);
+        if (restore() == 1) {
+          blkm = 0;
+          blkmot(blkm);
+          milling_motor = 0;
+          pwm_mot(0);
+          laser = 0;
+          att_laser(laser);
+          assixyz[0] = -1;
+          assixyz[1] = -1;
+          assixyz[2] = -1;
+          home.show();
+          card = 0;
+          return;
+        }
+        home.show();
+        card = 0;
+        return;
+      case 0:
+        vTaskDelete(taskIOHandle);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        taskIOHandle = NULL;
+        apribile.close();
+        SD.end();
+        blkm = 0;
+        blkmot(blkm);
+        milling_motor = 0;
+        pwm_mot(0);
+        laser = 0;
+        att_laser(laser);
+        assixyz[0] = -1;
+        assixyz[1] = -1;
+        assixyz[2] = -1;
+        home.show();
+        card = 0;
+        return;
+      case 2:
+        stop = 1;
+        break;
     }
     vTaskDelay(1);
   }
   vTaskDelete(taskIOHandle);
+  vTaskDelay(pdMS_TO_TICKS(200));
   taskIOHandle = NULL;
   milling_motor = 0;
   pwm_mot(0);
   apribile.close();
   SD.end();
   process.show();
+  tempo_stampa = millis() - tempo_stampa;
   muovi_pos(velocita_motori, assixyz[0], assixyz[1], z_sicur);
   muovi_pos(velocita_motori, float(max_x) / 2.0, max_y, z_sicur);
-  tempo_stampa = millis() - tempo_stampa;
+  if (restore() == 1) {
+    blkm = 0;
+    blkmot(blkm);
+    milling_motor = 0;
+    pwm_mot(0);
+    laser = 0;
+    att_laser(laser);
+    assixyz[0] = -1;
+    assixyz[1] = -1;
+    assixyz[2] = -1;
+    home.show();
+    card = 0;
+    return;
+  }
   val = 0;
   endprint.show();
   sprintf(buf, "%dh %dm %ds", tempo_stampa / 3600000, (tempo_stampa % 3600000) / 60000, (tempo_stampa % 60000) / 1000);
@@ -1624,15 +1904,15 @@ void task_stampa(void* parameter) {
   line = line_intestazione - 1;
   float x = 0, y = 0, z = 0, f = 0;
   bool tip = 0;
-  char riga[200];
+  char buf[15], riga[200];
   int len = 0, p = 0;
   while (1) {
     if (apribile.available()) {
       len = apribile.readBytesUntil('\n', riga, sizeof(riga) - 1);
       if (len <= 0) {
-        task = 0;
+        task = -2;
         while (1) {
-          vTaskDelay(pdMS_TO_TICKS(50));
+          vTaskDelay(pdMS_TO_TICKS(200));
         }
       }
       riga[len] = '\0';
@@ -1664,7 +1944,7 @@ void task_stampa(void* parameter) {
                 default:
                   task = -1;
                   while (1) {
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                    vTaskDelay(pdMS_TO_TICKS(200));
                   }
               }
               break;
@@ -1677,7 +1957,7 @@ void task_stampa(void* parameter) {
                 default:
                   task = -1;
                   while (1) {
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                    vTaskDelay(pdMS_TO_TICKS(200));
                   }
               }
               break;
@@ -1691,9 +1971,9 @@ void task_stampa(void* parameter) {
                         break;
                       }
                       if (feedrate > limiter_stepper) {
-                        muovi_pos(limiter_stepper, x + coord_x_min, max_y - (y + coord_y_min), assixyz[2]);
+                        muovi_pos(limiter_stepper, x + coord_x_min, max_y - ((stampa_y - y) + coord_y_min), assixyz[2]);
                       } else {
-                        muovi_pos(feedrate, x + coord_x_min, max_y - (y + coord_y_min), assixyz[2]);
+                        muovi_pos(feedrate, x + coord_x_min, max_y - ((stampa_y - y) + coord_y_min), assixyz[2]);
                       }
                       break;
                     case 'Z':
@@ -1730,9 +2010,9 @@ void task_stampa(void* parameter) {
                         break;
                       }
                       if (feedrate > limiter_stepper) {
-                        muovi_pos(limiter_stepper, x + coord_x_min, max_y - (y + coord_y_min), assixyz[2]);
+                        muovi_pos(limiter_stepper, x + coord_x_min, max_y - ((stampa_y - y) + coord_y_min), assixyz[2]);
                       } else {
-                        muovi_pos(feedrate, x + coord_x_min, max_y - (y + coord_y_min), assixyz[2]);
+                        muovi_pos(feedrate, x + coord_x_min, max_y - ((stampa_y - y) + coord_y_min), assixyz[2]);
                       }
                       break;
                     case 'Z':
@@ -1766,21 +2046,40 @@ void task_stampa(void* parameter) {
           }
           break;
         case 'T':
-          task = 3;
+          bprestm.setValue(4);
+          delayS(100);
+          if(tip == 1){
+            process.show();
+          }
           pwm_mot(0);
+          split = millis();
           sscanf(riga, "T%d", &p);
+          last_p = p;
+          prev_distanza_punta = distanza_punta;
+          prev_distanza_punta_base = distanza_punta_base;
           cambio_punta(p);
           if(distanza_punta_base == 0){
-            task = -1;
+            distanza_punta = prev_distanza_punta;
+            distanza_punta_base = prev_distanza_punta_base;
+            preferences.putFloat("punta", distanza_punta);
+            preferences.putFloat("base", distanza_punta_base);
+            task = 0;
             while (1) {
-              vTaskDelay(pdMS_TO_TICKS(50));
+              vTaskDelay(pdMS_TO_TICKS(200));
             }
           }
+          preferences.putFloat("punta", distanza_punta);
+          preferences.putFloat("base", distanza_punta_base);
+          vTaskDelay(1);
           tip = 1;
-          print.show();
-          task = 1;
-          muovi_pos(velocita_motori, x + coord_x_min, max_y - (y + coord_y_min), assixyz[2]);
+          muovi_pos(velocita_motori, x + coord_x_min, max_y - ((stampa_y - y) + coord_y_min), assixyz[2]);
           muovi_pos(velocita_motori, assixyz[0], assixyz[1], distanza_punta_base - z);
+          tempo_stampa = tempo_stampa + (millis() - split);
+          sprintf(buf, "%dh %dm ", (millis() - tempo_stampa) / 3600000, ((millis() - tempo_stampa) % 3600000) / 60000);
+          print.show();
+          delayS(30);
+          tempopr.setText(buf);
+          bprestm.setValue(0);
           break;
       }
       if (s > limiter_milling) {
@@ -1793,20 +2092,32 @@ void task_stampa(void* parameter) {
     if (line >= line_max - 2) {
       task = 2;
       while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(200));
       }
     }
-    if (restore() == 1) {
-      task = 0;
-      while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-      }
+    switch (restore()) {
+      case 1:
+        task = 0;
+        while (1) {
+          vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        break;
     }
-    if (stop_pressed == 1) {
-      task = -1;
-      while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-      }
+    switch (stop_pressed) {
+      case 1:
+        task = -1;
+        while (1) {
+          vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        break;
+      case 2:
+        last_z = distanza_punta_base - z;
+        split = millis();
+        task = 3;
+        while (task != 1) {
+          vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        break;
     }
     vTaskDelay(1);
   }
