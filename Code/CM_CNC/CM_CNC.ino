@@ -143,7 +143,7 @@ int i = 0, stato_percentuale_pwm = 50;
 float lunghezza = 0.1, velocita_motori = 6, distanza_punta = 0, distanza_punta_base = 0, prev_distanza_punta = 0, prev_distanza_punta_base = 0, z_minima = 0;
 float stampa_x_min = 0, stampa_x_max = 0, stampa_y_min = 0, stampa_y_max = 0, stampa_x = 0, stampa_y = 0, pre_print_x = 0, pre_print_y = 0;
 bool blkm = 0, luci = 0, luci_testa = 0, laser = 0, milling_motor = 0, segno = 1, card = 0, test = 0;
-unsigned long line_max = 0, line_intestazione = 0, er = 0, check = millis();
+unsigned long line_max = 0, er = 0, check = millis();
 char nomifile[5][101];
 uint8_t tempofile[5][2];
 
@@ -827,7 +827,7 @@ float calcola_tempo(File file) {
   int len = 0;
   char line[200];
   float x = 0, y = 0, z = 0, f = 0, pre_x = 0, pre_y = 0, pre_z = 0, tempo_tot = 0;
-  while(file.available()){
+  while (file.available()) {
     len = file.readBytesUntil('\n', line, sizeof(line) - 1);
     line[len] = '\0';
     switch (line[0]) {
@@ -876,7 +876,7 @@ float calcola_tempo(File file) {
       default:
         continue;
     }
-    tempo_tot += (float(t_offset)/60000.0) + hypot(hypot(x - pre_x, y - pre_y), z - pre_z) / fabs(f);
+    tempo_tot += (float(t_offset) / 60000.0) + hypot(hypot(x - pre_x, y - pre_y), z - pre_z) / fabs(f);
     pre_x = x;
     pre_y = y;
     pre_z = z;
@@ -921,17 +921,6 @@ bool lettura_range(bool prev_card, int indice) {
                 if (trovato_x && trovato_y) break;
               }
               file.seek(0);
-              line_intestazione = 0;
-              while (file.available()) {
-                check_fans();
-                int len = file.readBytesUntil('\n', line, sizeof(line) - 1);
-                line[len] = '\0';
-                if (line[0] == 'G' || line[0] == 'M' || line[0] == 'T') {
-                  break;
-                }
-                line_intestazione++;
-              }
-              file.seek(0);
               line_max = 0;
               while (file.available()) {
                 check_fans();
@@ -955,11 +944,11 @@ bool lettura_range(bool prev_card, int indice) {
   }
   return controllo;
 }
-void errore_carta(){
+void errore_carta() {
   uint32_t val = 0;
   card = 0;
   errore4.show();
-  while(val == 0){
+  while (val == 0) {
     b_press.getValue(&val);
     delay(300);
     check_fans();
@@ -1042,9 +1031,11 @@ void cambio_punta(int n_punta) {
     return;
   }
   c_punta.show();
+  b_press.setValue(0);
   delayS(500);
   uint32_t val = 0;
-  while (val == 0) {
+  bool flag_p = 0;
+  while (flag_p == 0) {
     vTaskDelay(1);
     check_fans();
     if (n_punta > 0) {
@@ -1053,13 +1044,21 @@ void cambio_punta(int n_punta) {
       ric_p.setText("TEST TIP");
     }
     b_press.getValue(&val);
-    delayS(10);
+    if (val != 0) {
+      delay(100);
+      b_press.getValue(&val);
+      if (val != 0) {
+        flag_p = 1;
+      }
+    }
+    delayS(200);
     if (restore() == 1) {
       distanza_punta = 0;
       distanza_punta_base = 0;
       return;
     }
   }
+  flag_p = 0;
   b_press.setValue(0);
   process.show();
   while (1) {
@@ -1459,7 +1458,7 @@ void STAMPA(int n_file) {
   File file = root.openNextFile();
   unsigned long t_card = millis();
   while (file) {
-    if(millis() - t_card >= 2500){
+    if (millis() - t_card >= 2500) {
       file.close();
       root.close();
       SD.end();
@@ -1548,9 +1547,9 @@ void STAMPA(int n_file) {
             delayS(100);
             bprestm.getValue(&val);
             if (val == 0) {
-              if(stop_pressed == 2){
+              if (stop_pressed == 2) {
                 pausa.show();
-              }else{
+              } else {
                 print.show();
               }
               delayS(400);
@@ -1562,7 +1561,7 @@ void STAMPA(int n_file) {
             bprestm.setValue(0);
             val = 0;
             stop_pressed = 2;
-            while(task != 3){
+            while (task != 3) {
               vTaskDelay(pdMS_TO_TICKS(50));
             }
             if (velocita_motori > limiter_stepper) {
@@ -1633,7 +1632,7 @@ void STAMPA(int n_file) {
         prtname.setText(String(nomifile[n_file]).c_str());
         sprintf(buf, "%dh %dm ", (millis() - tempo_stampa) / 3600000, ((millis() - tempo_stampa) % 3600000) / 60000);
         tempopr.setText(buf);
-        percepr.setValue(map(line - (line_intestazione - 1), 0, (line_max - 2) - (line_intestazione - 1), 0, 100));
+        percepr.setValue(map(line, 0, line_max, 0, 100));
         x_val.setText(String(assixyz[0], 2).c_str());
         y_val.setText(String(assixyz[1], 2).c_str());
         z_val.setText(String(assixyz[2], 2).c_str());
@@ -1676,9 +1675,9 @@ void STAMPA(int n_file) {
         vel_mil.setText(buff);
         break;
       case 30:
-        if(stop_pressed < 2){
+        if (stop_pressed < 2) {
           stop_pressed = 1;
-        }else{
+        } else {
           vTaskDelete(taskIOHandle);
           vTaskDelay(pdMS_TO_TICKS(200));
           taskIOHandle = NULL;
@@ -1714,14 +1713,14 @@ void STAMPA(int n_file) {
       case 32:
         pag = 0;
         b_press.getValue(&val);
-        if(val == 1){
+        if (val == 1) {
           process.show();
           float s_x = assixyz[0];
           float s_y = assixyz[1];
           prev_distanza_punta = distanza_punta;
           prev_distanza_punta_base = distanza_punta_base;
           cambio_punta(last_p);
-          if(distanza_punta_base == 0){
+          if (distanza_punta_base == 0) {
             distanza_punta = prev_distanza_punta;
             distanza_punta_base = prev_distanza_punta_base;
             preferences.putFloat("punta", distanza_punta);
@@ -1768,7 +1767,7 @@ void STAMPA(int n_file) {
           valpwm.setText(String(s).c_str());
         }
         delayS(50);
-        if(restore() == 1){
+        if (restore() == 1) {
           vTaskDelete(taskIOHandle);
           vTaskDelay(pdMS_TO_TICKS(200));
           taskIOHandle = NULL;
@@ -1901,7 +1900,7 @@ void STAMPA(int n_file) {
 void task_stampa(void* parameter) {
   s = 0;
   feedrate = 0;
-  line = line_intestazione - 1;
+  line = 0;
   float x = 0, y = 0, z = 0, f = 0;
   bool tip = 0;
   char buf[15], riga[200];
@@ -2048,7 +2047,7 @@ void task_stampa(void* parameter) {
         case 'T':
           bprestm.setValue(4);
           delayS(100);
-          if(tip == 1){
+          if (tip == 1) {
             process.show();
           }
           pwm_mot(0);
@@ -2058,7 +2057,7 @@ void task_stampa(void* parameter) {
           prev_distanza_punta = distanza_punta;
           prev_distanza_punta_base = distanza_punta_base;
           cambio_punta(p);
-          if(distanza_punta_base == 0){
+          if (distanza_punta_base == 0) {
             distanza_punta = prev_distanza_punta;
             distanza_punta_base = prev_distanza_punta_base;
             preferences.putFloat("punta", distanza_punta);
@@ -2087,9 +2086,9 @@ void task_stampa(void* parameter) {
       } else {
         pwm_mot(s);
       }
-      line++;
     }
-    if (line >= line_max - 2) {
+    line++;
+    if (line >= line_max) {
       task = 2;
       while (1) {
         vTaskDelay(pdMS_TO_TICKS(200));
